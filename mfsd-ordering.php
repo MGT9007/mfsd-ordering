@@ -2,13 +2,13 @@
 /**
  * Plugin Name: MFSD Ordering Utility
  * Description: Shared course ordering, task sequencing and student progress utility for all MFSD plugins.
- * Version:     1.0.0
+ * Version:     1.1.0
  * Author:      MisterT9007
  */
 
 if ( ! defined( 'ABSPATH' ) ) exit;
 
-define( 'MFSD_ORDERING_VERSION', '1.0.0' );
+define( 'MFSD_ORDERING_VERSION', '1.1.0' );
 
 // ─────────────────────────────────────────────
 // ACTIVATION & DB VERSIONING
@@ -286,4 +286,51 @@ function mfsd_get_courses() {
     return $wpdb->get_results(
         "SELECT * FROM {$wpdb->prefix}mfsd_courses WHERE active = 1 ORDER BY id ASC"
     );
+}
+
+/**
+ * Return a locked-task HTML message for display in a shortcode.
+ * Shows the name of the preceding task the student must complete first.
+ *
+ * @param  string $task_slug  The slug of the locked task.
+ * @return string             HTML string safe to return from a shortcode.
+ */
+function mfsd_ordering_locked_message( $task_slug ) {
+    global $wpdb;
+
+    $task      = mfsd_get_task_order_row( $task_slug );
+    $prev_name = 'the previous activity';
+
+    if ( $task && (int) $task->sequence_order > 1 ) {
+        $prev = $wpdb->get_row( $wpdb->prepare(
+            "SELECT display_name
+             FROM   {$wpdb->prefix}mfsd_task_order
+             WHERE  course_id       = %d
+               AND  sequence_order  = %d
+               AND  active          = 1
+             LIMIT  1",
+            $task->course_id,
+            (int) $task->sequence_order - 1
+        ) );
+        if ( $prev ) {
+            $prev_name = $prev->display_name;
+        }
+    }
+
+    ob_start();
+    ?>
+    <div style="max-width:600px;margin:40px auto;padding:32px;background:#fff;border:1px solid #e5e5e5;border-radius:14px;box-shadow:0 2px 8px rgba(0,0,0,.06);text-align:center;font-family:system-ui,-apple-system,sans-serif;">
+        <div style="font-size:48px;margin-bottom:16px;">🔒</div>
+        <h3 style="margin:0 0 12px;font-size:20px;color:#1d2327;">Activity Locked</h3>
+        <p style="color:#555;font-size:16px;line-height:1.6;margin:0 0 20px;">
+            You need to complete <strong><?php echo esc_html( $prev_name ); ?></strong>
+            before you can start this activity.
+        </p>
+        <a href="javascript:history.back()"
+           style="display:inline-block;padding:10px 24px;background:#111;color:#fff;border-radius:10px;text-decoration:none;font-size:14px;font-weight:600;">
+            ← Go Back
+        </a>
+    </div>
+    <?php
+    return ob_get_clean();
 }
