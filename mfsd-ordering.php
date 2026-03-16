@@ -2,13 +2,13 @@
 /**
  * Plugin Name: MFSD Ordering Utility
  * Description: Shared course ordering, task sequencing and student progress utility for all MFSD plugins.
- * Version:     1.1.0
- * Author:      MisterT9007
+ * Version:     1.2.0
+ * Author:      s47d
  */
 
 if ( ! defined( 'ABSPATH' ) ) exit;
 
-define( 'MFSD_ORDERING_VERSION', '1.1.0' );
+define( 'MFSD_ORDERING_VERSION', '1.2.0' );
 
 // ─────────────────────────────────────────────
 // ACTIVATION & DB VERSIONING
@@ -290,7 +290,9 @@ function mfsd_get_courses() {
 
 /**
  * Return a locked-task HTML message for display in a shortcode.
- * Shows the name of the preceding task the student must complete first.
+ * Finds the first incomplete task in the course sequence and names it,
+ * so the student knows exactly where to start rather than chasing
+ * a chain of locked screens.
  *
  * @param  string $task_slug  The slug of the locked task.
  * @return string             HTML string safe to return from a shortcode.
@@ -298,22 +300,30 @@ function mfsd_get_courses() {
 function mfsd_ordering_locked_message( $task_slug ) {
     global $wpdb;
 
-    $task      = mfsd_get_task_order_row( $task_slug );
-    $prev_name = 'the previous activity';
+    $task       = mfsd_get_task_order_row( $task_slug );
+    $first_name = 'the first activity in this course';
+    $student_id = get_current_user_id();
 
-    if ( $task && (int) $task->sequence_order > 1 ) {
-        $prev = $wpdb->get_row( $wpdb->prepare(
-            "SELECT display_name
-             FROM   {$wpdb->prefix}mfsd_task_order
-             WHERE  course_id       = %d
-               AND  sequence_order  = %d
-               AND  active          = 1
+    if ( $task ) {
+        // Find the first task in this course whose progress is not 'completed'
+        // for this student — that is the actual place they need to start.
+        $first_incomplete = $wpdb->get_row( $wpdb->prepare(
+            "SELECT t.display_name
+             FROM   {$wpdb->prefix}mfsd_task_order t
+             LEFT   JOIN {$wpdb->prefix}mfsd_task_progress p
+                    ON  p.task_slug  = t.task_slug
+                    AND p.student_id = %d
+             WHERE  t.course_id = %d
+               AND  t.active    = 1
+               AND  ( p.status IS NULL OR p.status != 'completed' )
+             ORDER  BY t.sequence_order ASC
              LIMIT  1",
-            $task->course_id,
-            (int) $task->sequence_order - 1
+            $student_id,
+            $task->course_id
         ) );
-        if ( $prev ) {
-            $prev_name = $prev->display_name;
+
+        if ( $first_incomplete ) {
+            $first_name = $first_incomplete->display_name;
         }
     }
 
@@ -323,7 +333,7 @@ function mfsd_ordering_locked_message( $task_slug ) {
         <div style="font-size:48px;margin-bottom:16px;">🔒</div>
         <h3 style="margin:0 0 12px;font-size:20px;color:#1d2327;">Activity Locked</h3>
         <p style="color:#555;font-size:16px;line-height:1.6;margin:0 0 20px;">
-            You need to complete <strong><?php echo esc_html( $prev_name ); ?></strong>
+            You need to complete <strong><?php echo esc_html( $first_name ); ?></strong>
             before you can start this activity.
         </p>
         <a href="javascript:history.back()"
