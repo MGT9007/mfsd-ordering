@@ -2,13 +2,13 @@
 /**
  * Plugin Name: MFSD Ordering Utility
  * Description: Shared course ordering, task sequencing and student progress utility for all MFSD plugins.
- * Version:     1.3.0
+ * Version:     1.4.0
  * Author:      s47d
  */
 
 if ( ! defined( 'ABSPATH' ) ) exit;
 
-define( 'MFSD_ORDERING_VERSION', '1.3.0' );
+define( 'MFSD_ORDERING_VERSION', '1.4.0' );
 
 // ─────────────────────────────────────────────
 // ACTIVATION & DB VERSIONING
@@ -435,4 +435,168 @@ function mfsd_get_course_week_titles( $course_id ) {
 
     ksort( $titles );
     return $titles;
+}
+
+// ─────────────────────────────────────────────
+// MYF-330 — ONE-OFF BACKFILL TOOL (TEMPORARY)
+//
+// Populates badge_slug/badge_image/coin_value/is_rag/counts_for_week_badge on
+// the existing Foundation Course task rows, plus wp_mfsd_course_weeks titles,
+// using today's mfsd-quest-log WEEK_BADGES/WEEK_CONFIG values as the source
+// of truth (MFSD_CourseManager_QuestLog_Integration_v1_0.md §7).
+//
+// Matches rows by task_slug and UPDATEs in place — never inserts a row, and
+// never touches wp_mfsd_badges / wp_mfsd_wallet. Course is chosen from a
+// dropdown rather than a hardcoded course_id, since there is no way to
+// confirm the Foundation Course's actual course_id without querying the live
+// site. Remove this whole section (and the admin_menu hook below) once the
+// backfill has been run and confirmed — see MYF-330 acceptance criteria.
+// ─────────────────────────────────────────────
+
+const MFSD_ORDERING_BACKFILL_DATA = [
+    1 => [
+        'title' => 'Week 1 — Self-Awareness & The Solutions Lens',
+        'tasks' => [
+            'solution_lens'           => [ 'badge_slug' => 'badge_solution_lens',    'badge_image' => 'badge_solution_lens.png',   'coin_value' => 10, 'is_rag' => 0 ],
+            'word_association'        => [ 'badge_slug' => 'badge_word_assoc',       'badge_image' => 'badge_word_assoc.png',      'coin_value' => 10, 'is_rag' => 0 ],
+            'personality_test_week_1' => [ 'badge_slug' => 'badge_who_am_i_1',       'badge_image' => 'badge_who_am_i_1.png',      'coin_value' => 10, 'is_rag' => 0 ],
+            'super_strengths'         => [ 'badge_slug' => 'badge_super_strengths',  'badge_image' => 'badge_super_strengths.png', 'coin_value' => 10, 'is_rag' => 0 ],
+            'rag_week_1'              => [ 'badge_slug' => 'badge_rag_w1',           'badge_image' => 'badge_rag_w1.png',          'coin_value' => 10, 'is_rag' => 1 ],
+        ],
+    ],
+    2 => [
+        'title' => 'Week 2 — Interests, Barriers & Dreams into Plans',
+        'tasks' => [
+            'life_wheel'        => [ 'badge_slug' => 'badge_life_wheel',   'badge_image' => null, 'coin_value' => 10, 'is_rag' => 0 ],
+            'junk_jobs'         => [ 'badge_slug' => 'badge_junk_jobs',    'badge_image' => 'badge_junk_jobs.png', 'coin_value' => 10, 'is_rag' => 0 ],
+            'favourite_subject' => [ 'badge_slug' => 'badge_fav_subject', 'badge_image' => null, 'coin_value' => 10, 'is_rag' => 0 ],
+            'barriers'          => [ 'badge_slug' => 'badge_barriers',    'badge_image' => null, 'coin_value' => 10, 'is_rag' => 0 ],
+            'dream_jobs'        => [ 'badge_slug' => 'badge_dream_jobs',  'badge_image' => null, 'coin_value' => 10, 'is_rag' => 0 ],
+            'who_am_i_part_2'   => [ 'badge_slug' => 'badge_who_am_i_2',  'badge_image' => null, 'coin_value' => 10, 'is_rag' => 0 ],
+            'rag_week_2'        => [ 'badge_slug' => 'badge_rag_w2',      'badge_image' => null, 'coin_value' => 15, 'is_rag' => 1 ],
+        ],
+    ],
+    3 => [
+        'title' => 'Week 3 — High Performance & Future Direction',
+        'tasks' => [
+            'fifty_on_success' => [ 'badge_slug' => 'badge_fifty_quid', 'badge_image' => null, 'coin_value' => 10, 'is_rag' => 0 ],
+            'hp_wheel'         => [ 'badge_slug' => 'badge_hp_wheel',   'badge_image' => null, 'coin_value' => 10, 'is_rag' => 0 ],
+            'what_is_hp'       => [ 'badge_slug' => 'badge_what_is_hp', 'badge_image' => null, 'coin_value' => 10, 'is_rag' => 0 ],
+            'dream_life'       => [ 'badge_slug' => 'badge_dream_life', 'badge_image' => null, 'coin_value' => 10, 'is_rag' => 0 ],
+            'rag_week_3'       => [ 'badge_slug' => 'badge_rag_w3',     'badge_image' => null, 'coin_value' => 20, 'is_rag' => 1 ],
+        ],
+    ],
+];
+
+add_action( 'admin_menu', function () {
+    add_management_page(
+        'MFSD Badge Backfill (MYF-330)',
+        'MFSD Badge Backfill',
+        'manage_options',
+        'mfsd-ordering-backfill',
+        'mfsd_ordering_render_backfill_page'
+    );
+} );
+
+function mfsd_ordering_render_backfill_page() {
+    if ( ! current_user_can( 'manage_options' ) ) return;
+
+    global $wpdb;
+    $result = null;
+
+    if ( ! empty( $_POST['mfsd_ordering_backfill_nonce'] )
+        && wp_verify_nonce( $_POST['mfsd_ordering_backfill_nonce'], 'mfsd_ordering_run_backfill' )
+    ) {
+        $course_id = (int) ( $_POST['course_id'] ?? 0 );
+
+        if ( $course_id > 0 ) {
+            $badge_images_base = plugins_url( 'assets/images/badges/', WP_PLUGIN_DIR . '/mfsd-quest-log/mfsd-quest-log.php' );
+
+            $updated  = [];
+            $unmatched = [];
+
+            foreach ( MFSD_ORDERING_BACKFILL_DATA as $week => $week_data ) {
+                foreach ( $week_data['tasks'] as $task_slug => $cfg ) {
+                    // Check existence first — $wpdb->update()'s affected-row count is 0
+                    // both when no row matches AND when a row matches but the values are
+                    // already identical (e.g. re-running this after a prior successful
+                    // run), so it can't be used on its own to tell "not found" apart
+                    // from "already correct".
+                    $exists = (int) $wpdb->get_var( $wpdb->prepare(
+                        "SELECT COUNT(*) FROM {$wpdb->prefix}mfsd_task_order WHERE course_id = %d AND task_slug = %s",
+                        $course_id, $task_slug
+                    ) );
+
+                    if ( ! $exists ) {
+                        $unmatched[] = $task_slug;
+                        continue;
+                    }
+
+                    $badge_image_url = $cfg['badge_image'] ? $badge_images_base . $cfg['badge_image'] : null;
+
+                    $wpdb->update(
+                        "{$wpdb->prefix}mfsd_task_order",
+                        [
+                            'badge_slug'            => $cfg['badge_slug'],
+                            'badge_image'           => $badge_image_url,
+                            'coin_value'            => $cfg['coin_value'],
+                            'is_rag'                => $cfg['is_rag'],
+                            'counts_for_week_badge' => 1,
+                        ],
+                        [ 'course_id' => $course_id, 'task_slug' => $task_slug ],
+                        [ '%s', '%s', '%d', '%d', '%d' ],
+                        [ '%d', '%s' ]
+                    );
+
+                    $updated[] = $task_slug;
+                }
+
+                $wpdb->query( $wpdb->prepare(
+                    "INSERT INTO {$wpdb->prefix}mfsd_course_weeks (course_id, week, title) VALUES (%d, %d, %s)
+                     ON DUPLICATE KEY UPDATE title = VALUES(title)",
+                    $course_id, $week, $week_data['title']
+                ) );
+            }
+
+            update_option( 'mfsd_quest_course_id', $course_id );
+
+            $result = [ 'updated' => $updated, 'unmatched' => $unmatched, 'course_id' => $course_id ];
+        }
+    }
+
+    $courses = mfsd_get_courses();
+    ?>
+    <div class="wrap">
+        <h1>MFSD Badge Backfill — one-off (MYF-330)</h1>
+        <p>Updates existing task rows in <code>wp_mfsd_task_order</code> in place (matched by <code>task_slug</code> — never inserts new rows), upserts the 3 week titles into <code>wp_mfsd_course_weeks</code>, and sets the <code>mfsd_quest_course_id</code> option. Does not touch <code>wp_mfsd_badges</code> or <code>wp_mfsd_wallet</code>.</p>
+
+        <?php if ( $result ) : ?>
+            <div class="notice notice-success">
+                <p><strong>Backfill run for course_id <?php echo esc_html( $result['course_id'] ); ?>.</strong></p>
+                <p>Updated (<?php echo count( $result['updated'] ); ?>): <?php echo esc_html( implode( ', ', $result['updated'] ) ); ?></p>
+                <?php if ( $result['unmatched'] ) : ?>
+                    <p style="color:#b32d2e;"><strong>Not found in wp_mfsd_task_order for this course (<?php echo count( $result['unmatched'] ); ?>):</strong> <?php echo esc_html( implode( ', ', $result['unmatched'] ) ); ?></p>
+                <?php endif; ?>
+            </div>
+        <?php endif; ?>
+
+        <form method="post">
+            <?php wp_nonce_field( 'mfsd_ordering_run_backfill', 'mfsd_ordering_backfill_nonce' ); ?>
+            <table class="form-table">
+                <tr>
+                    <th><label for="course_id">Course (select the Foundation Course)</label></th>
+                    <td>
+                        <select name="course_id" id="course_id" required>
+                            <option value="">— Select —</option>
+                            <?php foreach ( $courses as $course ) : ?>
+                                <option value="<?php echo esc_attr( $course->id ); ?>"><?php echo esc_html( $course->course_name . ' (' . $course->course_slug . ', id=' . $course->id . ')' ); ?></option>
+                            <?php endforeach; ?>
+                        </select>
+                    </td>
+                </tr>
+            </table>
+            <?php submit_button( 'Run Backfill' ); ?>
+        </form>
+    </div>
+    <?php
 }
