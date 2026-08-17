@@ -2,13 +2,13 @@
 /**
  * Plugin Name: MFSD Ordering Utility
  * Description: Shared course ordering, task sequencing and student progress utility for all MFSD plugins.
- * Version:     1.2.0
+ * Version:     1.3.0
  * Author:      s47d
  */
 
 if ( ! defined( 'ABSPATH' ) ) exit;
 
-define( 'MFSD_ORDERING_VERSION', '1.2.0' );
+define( 'MFSD_ORDERING_VERSION', '1.3.0' );
 
 // ─────────────────────────────────────────────
 // ACTIVATION & DB VERSIONING
@@ -56,8 +56,22 @@ function mfsd_install_ordering_tables() {
         task_slug      VARCHAR(100)     NOT NULL,
         display_name   VARCHAR(255)     NOT NULL,
         active         TINYINT(1)       NOT NULL DEFAULT 1,
+        badge_slug             VARCHAR(50)        NULL,
+        badge_image            VARCHAR(500)       NULL,
+        coin_value             SMALLINT UNSIGNED  NOT NULL DEFAULT 10,
+        is_rag                 TINYINT(1)         NOT NULL DEFAULT 0,
+        counts_for_week_badge  TINYINT(1)         NOT NULL DEFAULT 1,
         INDEX idx_course_seq  (course_id, sequence_order),
         INDEX idx_task_slug   (task_slug)
+    ) $c;" );
+
+    // Week titles per course — replaces the hardcoded WEEK_CONFIG labels in mfsd-quest-log
+    dbDelta( "CREATE TABLE IF NOT EXISTS {$wpdb->prefix}mfsd_course_weeks (
+        id          INT UNSIGNED     AUTO_INCREMENT PRIMARY KEY,
+        course_id   INT UNSIGNED     NOT NULL,
+        week        TINYINT UNSIGNED NOT NULL,
+        title       VARCHAR(255)     NOT NULL,
+        UNIQUE KEY uq_course_week (course_id, week)
     ) $c;" );
 
     // Per-student task progress — the single source of truth for the gate checks
@@ -343,4 +357,82 @@ function mfsd_ordering_locked_message( $task_slug ) {
     </div>
     <?php
     return ob_get_clean();
+}
+
+/**
+ * Get badge/coin config for a course, grouped by week.
+ * Replaces the WEEK_BADGES / WEEK_CONFIG constants previously hardcoded in
+ * mfsd-quest-log — Quest Log's engine and renderer both read this instead.
+ *
+ * @param  int   $course_id
+ * @return array  [ week_num => [ task_slug => [ display_name, badge_slug, badge_image,
+ *                                                coin_value, is_rag, counts_for_week_badge ] ] ]
+ *                Active tasks only, ordered by sequence_order within each week.
+ */
+function mfsd_get_course_badge_config( $course_id ) {
+    global $wpdb;
+
+    $rows = $wpdb->get_results( $wpdb->prepare(
+        "SELECT week, task_slug, display_name, badge_slug, badge_image,
+                coin_value, is_rag, counts_for_week_badge
+         FROM   {$wpdb->prefix}mfsd_task_order
+         WHERE  course_id = %d
+           AND  active    = 1
+         ORDER  BY week ASC, sequence_order ASC",
+        $course_id
+    ) );
+
+    $result = [];
+    foreach ( $rows as $row ) {
+        $week = (int) $row->week;
+        if ( ! isset( $result[ $week ] ) ) {
+            $result[ $week ] = [];
+        }
+        $result[ $week ][ $row->task_slug ] = [
+            'display_name'          => $row->display_name,
+            'badge_slug'            => $row->badge_slug,
+            'badge_image'           => $row->badge_image,
+            'coin_value'            => (int) $row->coin_value,
+            'is_rag'                => (bool) $row->is_rag,
+            'counts_for_week_badge' => (bool) $row->counts_for_week_badge,
+        ];
+    }
+    return $result;
+}
+
+/**
+ * Get week titles for a course.
+ * Falls back to "Week N" for any week that has active tasks but no row yet
+ * in wp_mfsd_course_weeks (e.g. immediately after the schema migration,
+ * before a title has been set from Course Manager).
+ *
+ * @param  int   $course_id
+ * @return array  [ week_num => title ]
+ */
+function mfsd_get_course_week_titles( $course_id ) {
+    global $wpdb;
+
+    $rows = $wpdb->get_results( $wpdb->prepare(
+        "SELECT week, title FROM {$wpdb->prefix}mfsd_course_weeks WHERE course_id = %d",
+        $course_id
+    ) );
+
+    $titles = [];
+    foreach ( $rows as $row ) {
+        $titles[ (int) $row->week ] = $row->title;
+    }
+
+    $weeks_with_tasks = $wpdb->get_col( $wpdb->prepare(
+        "SELECT DISTINCT week FROM {$wpdb->prefix}mfsd_task_order WHERE course_id = %d AND active = 1",
+        $course_id
+    ) );
+    foreach ( $weeks_with_tasks as $week ) {
+        $week = (int) $week;
+        if ( ! isset( $titles[ $week ] ) ) {
+            $titles[ $week ] = "Week {$week}";
+        }
+    }
+
+    ksort( $titles );
+    return $titles;
 }
