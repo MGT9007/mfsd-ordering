@@ -2,13 +2,13 @@
 /**
  * Plugin Name: MFSD Ordering Utility
  * Description: Shared course ordering, task sequencing and student progress utility for all MFSD plugins.
- * Version:     1.4.0
+ * Version:     1.5.0
  * Author:      s47d
  */
 
 if ( ! defined( 'ABSPATH' ) ) exit;
 
-define( 'MFSD_ORDERING_VERSION', '1.4.0' );
+define( 'MFSD_ORDERING_VERSION', '1.5.0' );
 
 // ─────────────────────────────────────────────
 // ACTIVATION & DB VERSIONING
@@ -61,6 +61,8 @@ function mfsd_install_ordering_tables() {
         coin_value             SMALLINT UNSIGNED  NOT NULL DEFAULT 10,
         is_rag                 TINYINT(1)         NOT NULL DEFAULT 0,
         counts_for_week_badge  TINYINT(1)         NOT NULL DEFAULT 1,
+        shimmer_enabled        TINYINT(1)         NOT NULL DEFAULT 0,
+        shimmer_interval       SMALLINT UNSIGNED  NOT NULL DEFAULT 5,
         INDEX idx_course_seq  (course_id, sequence_order),
         INDEX idx_task_slug   (task_slug)
     ) $c;" );
@@ -374,7 +376,8 @@ function mfsd_get_course_badge_config( $course_id ) {
 
     $rows = $wpdb->get_results( $wpdb->prepare(
         "SELECT week, task_slug, display_name, badge_slug, badge_image,
-                coin_value, is_rag, counts_for_week_badge
+                coin_value, is_rag, counts_for_week_badge,
+                shimmer_enabled, shimmer_interval
          FROM   {$wpdb->prefix}mfsd_task_order
          WHERE  course_id = %d
            AND  active    = 1
@@ -395,6 +398,8 @@ function mfsd_get_course_badge_config( $course_id ) {
             'coin_value'            => (int) $row->coin_value,
             'is_rag'                => (bool) $row->is_rag,
             'counts_for_week_badge' => (bool) $row->counts_for_week_badge,
+            'shimmer_enabled'       => (bool) $row->shimmer_enabled,
+            'shimmer_interval'      => (int) $row->shimmer_interval,
         ];
     }
     return $result;
@@ -564,6 +569,56 @@ function mfsd_ordering_render_backfill_page() {
         }
     }
 
+    // MYF-340 — shimmer config backfill. Separate form/nonce on the same page.
+    // Matches by badge_slug (not task_slug) since mfsd_quest_shimmer_config is
+    // keyed by badge slug — different key to MYF-330's task_slug-keyed source.
+    $shimmer_result = null;
+
+    if ( ! empty( $_POST['mfsd_ordering_shimmer_backfill_nonce'] )
+        && wp_verify_nonce( $_POST['mfsd_ordering_shimmer_backfill_nonce'], 'mfsd_ordering_run_shimmer_backfill' )
+    ) {
+        $shimmer_course_id = (int) ( $_POST['shimmer_course_id'] ?? 0 );
+
+        if ( $shimmer_course_id > 0 ) {
+            $shimmer_raw = get_option( 'mfsd_quest_shimmer_config', '{}' );
+            $shimmer_cfg = json_decode( $shimmer_raw, true );
+
+            if ( ! is_array( $shimmer_cfg ) ) {
+                $shimmer_result = [ 'error' => 'mfsd_quest_shimmer_config could not be parsed as JSON.' ];
+            } else {
+                $updated   = [];
+                $unmatched = [];
+
+                foreach ( $shimmer_cfg as $badge_slug => $cfg ) {
+                    $exists = (int) $wpdb->get_var( $wpdb->prepare(
+                        "SELECT COUNT(*) FROM {$wpdb->prefix}mfsd_task_order WHERE course_id = %d AND badge_slug = %s",
+                        $shimmer_course_id, $badge_slug
+                    ) );
+
+                    if ( ! $exists ) {
+                        $unmatched[] = $badge_slug;
+                        continue;
+                    }
+
+                    $wpdb->update(
+                        "{$wpdb->prefix}mfsd_task_order",
+                        [
+                            'shimmer_enabled'  => ! empty( $cfg['on'] ) ? 1 : 0,
+                            'shimmer_interval' => max( 2, min( 30, (int) ( $cfg['interval'] ?? 5 ) ) ),
+                        ],
+                        [ 'course_id' => $shimmer_course_id, 'badge_slug' => $badge_slug ],
+                        [ '%d', '%d' ],
+                        [ '%d', '%s' ]
+                    );
+
+                    $updated[] = $badge_slug;
+                }
+
+                $shimmer_result = [ 'updated' => $updated, 'unmatched' => $unmatched, 'course_id' => $shimmer_course_id ];
+            }
+        }
+    }
+
     $courses = mfsd_get_courses();
     ?>
     <div class="wrap">
@@ -596,6 +651,42 @@ function mfsd_ordering_render_backfill_page() {
                 </tr>
             </table>
             <?php submit_button( 'Run Backfill' ); ?>
+        </form>
+
+        <hr>
+        <h1>Shimmer Config Backfill — one-off (MYF-340)</h1>
+        <p>Reads the existing <code>mfsd_quest_shimmer_config</code> option (per-badge Shimmer Sweep settings from Quest Log) and copies each entry into <code>shimmer_enabled</code>/<code>shimmer_interval</code> on the matching <code>wp_mfsd_task_order</code> row — matched by <strong>badge_slug</strong>, not task_slug. Does not touch Coin Spin config, which stays in Quest Log unchanged.</p>
+
+        <?php if ( $shimmer_result ) : ?>
+            <?php if ( ! empty( $shimmer_result['error'] ) ) : ?>
+                <div class="notice notice-error"><p><?php echo esc_html( $shimmer_result['error'] ); ?></p></div>
+            <?php else : ?>
+                <div class="notice notice-success">
+                    <p><strong>Shimmer backfill run for course_id <?php echo esc_html( $shimmer_result['course_id'] ); ?>.</strong></p>
+                    <p>Updated (<?php echo count( $shimmer_result['updated'] ); ?>): <?php echo esc_html( implode( ', ', $shimmer_result['updated'] ) ); ?></p>
+                    <?php if ( $shimmer_result['unmatched'] ) : ?>
+                        <p style="color:#b32d2e;"><strong>Badge slugs in mfsd_quest_shimmer_config with no matching wp_mfsd_task_order row for this course (<?php echo count( $shimmer_result['unmatched'] ); ?>):</strong> <?php echo esc_html( implode( ', ', $shimmer_result['unmatched'] ) ); ?></p>
+                    <?php endif; ?>
+                </div>
+            <?php endif; ?>
+        <?php endif; ?>
+
+        <form method="post">
+            <?php wp_nonce_field( 'mfsd_ordering_run_shimmer_backfill', 'mfsd_ordering_shimmer_backfill_nonce' ); ?>
+            <table class="form-table">
+                <tr>
+                    <th><label for="shimmer_course_id">Course (select the Foundation Course)</label></th>
+                    <td>
+                        <select name="shimmer_course_id" id="shimmer_course_id" required>
+                            <option value="">— Select —</option>
+                            <?php foreach ( $courses as $course ) : ?>
+                                <option value="<?php echo esc_attr( $course->id ); ?>"><?php echo esc_html( $course->course_name . ' (' . $course->course_slug . ', id=' . $course->id . ')' ); ?></option>
+                            <?php endforeach; ?>
+                        </select>
+                    </td>
+                </tr>
+            </table>
+            <?php submit_button( 'Run Shimmer Backfill' ); ?>
         </form>
     </div>
     <?php
